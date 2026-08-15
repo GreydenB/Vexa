@@ -17,7 +17,13 @@ import threading
 from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QApplication
 
-from voice_animation import create_waveform, display_amplitude, hide_waveform
+from waveform_overlay import (
+    create_waveform,
+    display_amplitude,
+    hide_waveform,
+    initialize_waveform,
+    shutdown_application,
+)
 
 
 
@@ -64,7 +70,8 @@ def record_audio(
     silence_duration: float = 2.5,
 ):
     
-    chunk_size = int(0.2 * SAMPLE_RATE)
+    # Short chunks make the waveform react promptly while the user speaks.
+    chunk_size = int(0.05 * SAMPLE_RATE)
     chunks = []
     elapsed = 0.0
     silent_chunks = 0
@@ -82,9 +89,17 @@ def record_audio(
         chunk_duration = len(chunk) / SAMPLE_RATE
         elapsed += chunk_duration
 
-        amplitude = np.abs(chunk).mean() / 32768.0
-        if (app):
-            display_amplitude(amplitude)
+        samples = chunk.astype(np.float32) / 32768.0
+        amplitude = float(np.sqrt(np.mean(samples * samples)))
+
+        # Convert microphone RMS to the overlay's expected 0-1 range.
+        # Roughly -50 dB is quiet and -15 dB is loud speech.
+        decibels = 20.0 * np.log10(max(amplitude, 1e-7))
+        visual_amplitude = float(
+            np.clip((decibels + 50.0) / 35.0, 0.0, 1.0)
+        )
+        if app:
+            display_amplitude(visual_amplitude)
 
         if amplitude < silence_threshold:
             silent_chunks += 1
@@ -106,20 +121,19 @@ def transcribe_audio(filename: str = AUDIO_FILE) -> str:
         transcript = client.audio.transcriptions.create(
             model="gpt-transcribe",
             file=audio_file,
-            language=["en"],
-            prompt="The speaker is giving commands to a desktop AI assistant.",
-            keywords=[
-                "OpenAI",
-                "PySide6",
-                "Python",
-                "Vexa",
-                "Power Down"
-            ],
+            prompt="The speaker is giving a command to a desktop AI assistant named Vexa.",
+            temperature=0,
+            extra_body={
+                "keywords": [
+                    "power down",
+                    "vexa",
+                    "hey vexa"
+                ],
+                "languages": ["en"],
+            },
         )
-    if "openai pyside6 python vexa" in transcript.text:
-        transcript.text = None
-        
-    return transcript.text
+
+    return transcript.text.strip()
 
 def speak_text(text: str, filename: str = TTS_FILE):
     with client.audio.speech.with_streaming_response.create(
@@ -148,17 +162,6 @@ def main():
         "unless told otherwise"
     }]
 
-    # Ensure a single QApplication exists and its event loop is running so
-    # the waveform overlay can be created on demand. The event loop is
-    # started in a daemon thread so the existing console loop can continue.
-    app = QApplication.instance()
-    if app is None:
-        app = QApplication([])
-        threading.Thread(target=app.exec, daemon=True).start()
-
-
-
-
     while True:
         start = time.time()
         has_user_input = False
@@ -179,6 +182,7 @@ def main():
         # Swap to audio input mode if "shift+q" is pressed
         if keyboard.is_pressed("shift+q"):
             print("Recording Started:")
+            create_waveform()
 
             try:
                 record_audio(True)
@@ -257,4 +261,17 @@ def main():
         elapsed = time.time() - start
         time.sleep(max(0, (1/10) - elapsed))
 
-main()
+if __name__ == "__main__":
+    app = QApplication([])
+    initialize_waveform()
+
+    def run_assistant() -> None:
+        try:
+            main()
+        finally:
+            shutdown_application()
+
+    worker = threading.Thread(target=run_assistant, daemon=True)
+    worker.start()
+
+    app.exec()

@@ -15,7 +15,7 @@ import sys
 import threading
 from dataclasses import dataclass
 
-from PySide6.QtCore import QElapsedTimer, QTimer, Qt, Signal, Slot
+from PySide6.QtCore import QObject, QElapsedTimer, QTimer, Qt, Signal, Slot
 from PySide6.QtGui import QColor, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import QApplication, QWidget
 
@@ -126,9 +126,6 @@ _YELLOW_WAVE = WaveStyle(
     fill_color=QColor(205, 205, 45, 235),
     
 )
-
-
-_overlay: AnimationWindow | None = None
 
 
 class AnimationWindow(QWidget):
@@ -552,49 +549,98 @@ class AnimationWindow(QWidget):
             window_above = _get_window(window_above, _GW_HWNDPREV)
 
 
-def create_waveform() -> AnimationWindow:
-    """Create and show the shared waveform overlay once."""
-    global _overlay
+class WaveformController(QObject):
+    """Marshal waveform requests from worker threads onto the GUI thread."""
 
-    if _overlay is not None:
-        _overlay.show()
-        _overlay.raise_()
-        return _overlay
+    show_requested = Signal()
+    hide_requested = Signal()
+    amplitude_requested = Signal(float)
+    shutdown_requested = Signal()
 
-    app = QApplication.instance()
-    if app is None:
-        raise RuntimeError(
-            "Create QApplication before calling create_waveform()."
+    def __init__(self) -> None:
+        super().__init__()
+        self._overlay: AnimationWindow | None = None
+        self.show_requested.connect(self.show, Qt.QueuedConnection)
+        self.hide_requested.connect(self.hide, Qt.QueuedConnection)
+        self.amplitude_requested.connect(
+            self.display_amplitude,
+            Qt.QueuedConnection,
+        )
+        self.shutdown_requested.connect(
+            QApplication.instance().quit,
+            Qt.QueuedConnection,
         )
 
-    screen = app.primaryScreen()
-    if screen is None:
-        raise RuntimeError("No primary display is available.")
+    def _ensure_overlay(self) -> AnimationWindow:
+        if self._overlay is not None:
+            return self._overlay
 
-    _overlay = AnimationWindow()
-    _overlay.fit_to_screen(screen.geometry())
-    screen.geometryChanged.connect(_overlay.fit_to_screen)
+        app = QApplication.instance()
+        if app is None:
+            raise RuntimeError("QApplication has not been created.")
 
-    _overlay.show()
-    _overlay.raise_()
+        screen = app.primaryScreen()
+        if screen is None:
+            raise RuntimeError("No primary display is available.")
 
-    # The native handle is reliable after show(). Apply the Windows style on
-    # the next event-loop pass, then begin the low-frequency taskbar check.
-    QTimer.singleShot(0, _overlay.start_taskbar_monitor)
+        self._overlay = AnimationWindow()
+        self._overlay.fit_to_screen(screen.geometry())
+        screen.geometryChanged.connect(self._overlay.fit_to_screen)
+        return self._overlay
 
-    return _overlay
+    @Slot()
+    def show(self) -> None:
+        overlay = self._ensure_overlay()
+        overlay.show()
+        overlay.raise_()
+
+        if overlay._taskbar_monitor is None:
+            QTimer.singleShot(0, overlay.start_taskbar_monitor)
+
+    @Slot()
+    def hide(self) -> None:
+        if self._overlay is not None:
+            self._overlay.hide()
+
+    @Slot(float)
+    def display_amplitude(self, amplitude: float) -> None:
+        self._ensure_overlay().display_amplitude(amplitude)
+
+
+_controller: WaveformController | None = None
+
+
+def initialize_waveform() -> None:
+    """Initialize the controller from the QApplication's main thread."""
+    global _controller
+
+    if QApplication.instance() is None:
+        raise RuntimeError("Create QApplication before initializing waveform.")
+    if _controller is None:
+        _controller = WaveformController()
+
+
+def _get_controller() -> WaveformController:
+    if _controller is None:
+        raise RuntimeError("Call initialize_waveform() before using waveform.")
+    return _controller
+
+
+def create_waveform() -> None:
+    """Request that the GUI thread create and show the overlay."""
+    _get_controller().show_requested.emit()
 
 
 def hide_waveform() -> None:
-    """Hide the shared waveform overlay until the next wake word."""
-    if _overlay is not None:
-        _overlay.hide()
+    """Request that the GUI thread hide the overlay."""
+    _get_controller().hide_requested.emit()
 
 
 def display_amplitude(amplitude: float) -> None:
-    """Send an amplitude sample to the shared overlay."""
-    if _overlay is None:
-        create_waveform()
+    """Send an amplitude sample to the GUI thread."""
+    _get_controller().amplitude_requested.emit(float(amplitude))
 
-    assert _overlay is not None
-    _overlay.display_amplitude(amplitude)
+
+def shutdown_application() -> None:
+    """Request that the GUI event loop stop after the worker exits."""
+    _get_controller().shutdown_requested.emit()
