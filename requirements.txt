@@ -1,9 +1,0 @@
-keyboard
-numpy
-openai
-openwakeword>=0.6,<0.7
-pygame
-PySide6
-python-dotenv
-sounddevice
-soundfile

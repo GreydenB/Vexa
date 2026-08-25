@@ -12,7 +12,7 @@ import time
 import msvcrt
 import threading
 from rapidfuzz.fuzz import ratio
-
+import json
 from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QApplication
 
@@ -23,12 +23,23 @@ from waveform_overlay import (
     initialize_waveform,
     shutdown_application,
 )
+import tool_types
+import vexa_tools
 
+FUNCTIONS = {
+    "open_application": vexa_tools.open_application
+}
+
+
+
+END_CONVERSATION_KEYWORD = "end conversation"
 END_LOOP_KEYWORD = "power down"
 MAX_MESSAGES = 10
 SAMPLE_RATE = 16000
 AUDIO_FILE = "user_input.wav"
 TTS_FILE = "vexa_reply.mp3"
+
+
 
 #load .env vars
 load_dotenv()
@@ -69,6 +80,10 @@ class MicrophoneStream:
             self.stream.stop()
         self.stream.close()
 
+    def restart(self):
+        if self.stream.active:
+            self.stream.abort()  # Discard queued microphone data
+        self.stream.start()
 
 
 def clear_buffer():
@@ -76,10 +91,27 @@ def clear_buffer():
         msvcrt.getch()
 
 def wake_word_match(transcript):
-    score = ratio(transcript, "hey vexa")
-    print("Wake score:", score)
+    current = transcript.lower().strip()
 
-    return score >= 75
+    previous = getattr(
+        wake_word_match,
+        "previous_sample",
+        ""
+    )
+
+    combined = f"{previous} {current}".strip()
+
+    current_score = ratio(current, "hey vexa")
+    combined_score = ratio(combined, "hey vexa")
+
+    matched = max(current_score, combined_score) >= 75
+
+    if matched:
+        wake_word_match.previous_sample = ""
+    else:
+        wake_word_match.previous_sample = current
+
+    return matched
 
 def record_fixed_window(
     microphone,
@@ -90,13 +122,14 @@ def record_fixed_window(
     audio = microphone.read(frames)
     sf.write(filename, audio, SAMPLE_RATE)
 
+
 def record_audio(
     app: bool = False,
     seconds: int = 5,
     filename: str = AUDIO_FILE,
     max_seconds: int = 30,
-    silence_threshold: float = 0.02,
-    silence_duration: float = 2.5,
+    silence_threshold: float = 0.005,
+    silence_duration: float = 2.0,
     microphone: MicrophoneStream | None = None,
 ):
     
@@ -105,7 +138,7 @@ def record_audio(
     chunks = []
     elapsed = 0.0
     silent_chunks = 0
-
+    has_heard_speech = False
     while elapsed < max_seconds:
         try:
             chunk = microphone.read(chunk_size)
@@ -130,15 +163,16 @@ def record_audio(
         if app:
             display_amplitude(visual_amplitude)
 
-        if amplitude < silence_threshold:
-            silent_chunks += 1
-        else:
+        if amplitude >= silence_threshold:
             silent_chunks = 0
+            has_heard_speech = True
+        elif has_heard_speech:
+            silent_chunks += 1
 
         required_silent_chunks = int(
             silence_duration / chunk_duration
         )
-        if elapsed >= seconds and silent_chunks >= required_silent_chunks:
+        if silent_chunks >= required_silent_chunks:
             break
 
     if chunks:
@@ -209,13 +243,15 @@ def main():
         "content": "You are Vexa, a helpful desktop AI assistant. "
         "Be clear, concise, and practical. Respond in 3 sentences or less, "
         "unless told otherwise"
+        "User is talking to you through a microphone and the users words are being transcribed to you."
     }]
+    
 
     try:
         print("------Vexa Online------\n")
+        
         while True:
             start = time.time()
-            has_user_input = False
 
             # Swap to text input mode if "t+=" is pressed
             if keyboard.is_pressed("t+="):
@@ -232,29 +268,6 @@ def main():
                     continue
 
             # Swap to audio input mode if "shift+q" is pressed
-            if keyboard.is_pressed("shift+q"):
-
-                print("Recording Started:")
-                create_waveform()
-
-                try:
-                    record_audio(True, microphone)
-                    user_input = transcribe_audio()
-                    has_user_input = True
-
-                    if END_LOOP_KEYWORD in user_input.lower():
-                        break
-
-                    elif user_input.lower() == "clear memory":
-                        conversation = [conversation[0]]
-                        print("\nVexa: Memory cleared.\n")
-                        continue
-
-                    print(f"You said: {user_input}\n")
-
-                except Exception as e:
-                    print(f"\nVexa: Audio error: {e}\n")
-                    continue
 
             # Listen for wake word if no input mode is active
             else:
@@ -279,66 +292,96 @@ def main():
                         pygame.mixer.music.play()
                         create_waveform()
 
-                        print(
-                            "Wake word detected. "
-                            "Listening for your command..."
-                        )
+                        convo_ended = False
+                        while not convo_ended:
+                            microphone.restart()
+                            record_audio(
+                                app=True,
+                                seconds=30,
+                                microphone=microphone,
+                            )
+                            user_input = transcribe_audio()
+                            
 
-                        record_audio(
-                            app=True,
-                            microphone=microphone,
-                        )
-                        user_input = transcribe_audio()
-                        has_user_input = True
+                            if END_LOOP_KEYWORD in user_input.lower():
+                                print("\nVexa: Powering down.\n")
+                                return
 
-                        if END_LOOP_KEYWORD in user_input.lower():
-                            break
+                            if END_CONVERSATION_KEYWORD in user_input.lower():
+                                convo_ended = True
+                                print("\nVexa: Conversation ended.\n")
+                                
 
-                        if user_input.lower() == "clear memory":
-                            conversation = [conversation[0]]
-                            print("\nVexa: Memory cleared.\n")
-                            continue
+                            if user_input.lower() == "clear memory":
+                                conversation = [conversation[0]]
+                                print("\nVexa: Memory cleared.\n")
+                                continue
 
-                        print(f"You said: {user_input}\n")
+                            print(f"You said: {user_input}\n")
 
+                            if not user_input.strip().strip(". "):
+                                continue
+
+                            conversation.append({
+                                "role": "user",
+                                "content": user_input
+                            })
+
+                        
+
+                            response = client.responses.create(
+                            model="gpt-5.4",
+                            input = conversation,
+                            tools= tool_types.tools
+                            )
+                            for item in response.output:
+                                if item.type == "function_call":
+
+                                    function_name = item.name
+                                    arguments = json.loads(item.arguments)
+
+                                    print(f"Calling: {function_name}")
+                                    print(f"Arguments: {arguments}")
+
+                                    function = FUNCTIONS.get(function_name)
+
+                                    if function:
+                                        result = function(**arguments)
+                            reply = response.output_text
+                            
+                            conversation.append({
+                                "role": "assistant",
+                                "content": reply
+                            })
+                            conversation = [conversation[0]] + conversation[-MAX_MESSAGES:]
+
+                            
+
+                            try:
+                                if reply:
+                                    print("\nVexa: ",reply,"\n")
+                                    speak_text(reply)
+                            except Exception as e:
+                                print(f"Vexa: TTS error: {e}")
+                            finally:
+                                hide_waveform() 
+                            elapsed = time.time() - start
+                            time.sleep(max(0, (1/10) - elapsed))
+                            
+
+                            while pygame.mixer.music.get_busy():
+                                time.sleep(0.1)
+
+                            if not convo_ended:
+                                create_waveform()
+                                pygame.mixer.music.load("listening.mp3")
+                                pygame.mixer.music.play()
                 except Exception as error:
                     print(f"Wake word check failed: {error}")
 
-            if has_user_input:
-                if not user_input.strip().strip(". "):
-                    continue
-
-                conversation.append({
-                    "role": "user",
-                    "content": user_input
-                })
-
-            
-
-                response = client.responses.create(
-                model="gpt-5.4",
-                input = conversation
-                )
-
-                reply = response.output_text
-
-                conversation.append({
-                    "role": "assistant",
-                    "content": reply
-                })
-                conversation = [conversation[0]] + conversation[-MAX_MESSAGES:]
-
-                print("\nVexa: ",reply,"\n")
-
-                try:
-                    speak_text(reply)
-                except Exception as e:
-                    print(f"Vexa: TTS error: {e}")
-                finally:
-                    hide_waveform() 
+ 
                 
-            elapsed = time.time() - start
-            time.sleep(max(0, (1/10) - elapsed))
+                
 
     finally:
         microphone.close()
