@@ -32,6 +32,7 @@ FUNCTIONS = {
 
 
 
+END_LISTENING_KEYWORD = "stop listening"
 END_CONVERSATION_KEYWORD = "end conversation"
 END_LOOP_KEYWORD = "power down"
 MAX_MESSAGES = 10
@@ -122,6 +123,12 @@ def record_fixed_window(
     audio = microphone.read(frames)
     sf.write(filename, audio, SAMPLE_RATE)
 
+    # if the RMS amplitude is below a threshold, consider it silence and return False
+    rms = np.sqrt(
+        np.mean((audio.astype(np.float32) / 32768.0) ** 2)
+    )
+    return bool(rms >= 0.005)
+
 
 def record_audio(
     app: bool = False,
@@ -187,7 +194,7 @@ def transcribe_audio(filename: str = AUDIO_FILE) -> str:
             file=audio_file,
             prompt=(
                 "The speaker is giving a command to a desktop AI assistant named Vexa."
-                "Listen for the wake phrase 'Hey Vexa'. "
+                "Listen for the wake phrase 'Vexa'. "
                 "Vexa is pronounced 'VEX-uh'. "
                 "The recording may contain only this short phrase."  
             ),
@@ -197,7 +204,6 @@ def transcribe_audio(filename: str = AUDIO_FILE) -> str:
                 "keywords": [
                     "power down",
                     "vexa",
-                    "hey vexa",
                 ],
                 "languages": ["en"],
             },
@@ -236,6 +242,7 @@ def speak_text(text: str, filename: str = TTS_FILE):
 
 
 def main():
+    listening = False
     microphone = MicrophoneStream()
     microphone.start()
     conversation = [{
@@ -244,6 +251,8 @@ def main():
         "Be clear, concise, and practical. Respond in 3 sentences or less, "
         "unless told otherwise"
         "User is talking to you through a microphone and the users words are being transcribed to you."
+        "If user says 'stop listening' respond with 'No longer listening'"
+        "If user says 'end conversation' respond with 'Conversation ended'"
     }]
     
 
@@ -268,17 +277,28 @@ def main():
                     continue
 
             # Swap to audio input mode if "shift+q" is pressed
+            if keyboard.is_pressed("shift+q"):
+                listening = True
+                pygame.mixer.music.load("listening.mp3")
+                pygame.mixer.music.play()
+                print("\nVexa: Listening\n")
 
+                time.sleep(0.5)  # Debounce to prevent rapid toggling
+                
             # Listen for wake word if no input mode is active
-            else:
+            elif listening:
                 try:
                 
-                    record_fixed_window(
+                    audio_detected = record_fixed_window(
                         microphone,
                         seconds=1.5,
                         filename="wake_word.wav",
                     )
-
+                    if not audio_detected:
+                        print("No audio detected")
+                        continue
+                    else:
+                        print("Audio detected")
                     transcript = transcribe_audio(
                         "wake_word.wav"
                     ).lower()
@@ -301,15 +321,23 @@ def main():
                                 microphone=microphone,
                             )
                             user_input = transcribe_audio()
-                            
+
+                            print("TRANSCRIPT:", repr(user_input))
 
                             if END_LOOP_KEYWORD in user_input.lower():
                                 print("\nVexa: Powering down.\n")
+                                listening = False
+                                convo_ended = True
                                 return
 
                             if END_CONVERSATION_KEYWORD in user_input.lower():
                                 convo_ended = True
                                 print("\nVexa: Conversation ended.\n")
+
+                            if END_LISTENING_KEYWORD in user_input.lower():
+                                listening = False
+                                convo_ended = True
+                                print("\nVexa: Stopped listening.\n")
                                 
 
                             if user_input.lower() == "clear memory":
@@ -379,7 +407,8 @@ def main():
                 except Exception as error:
                     print(f"Wake word check failed: {error}")
 
- 
+            if not listening:
+                time.sleep(0.05)
                 
                 
 
